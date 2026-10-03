@@ -1,10 +1,12 @@
-"""Small fail-closed FFmpeg placeholder renderer for n8n Render Free demo.
+"""Small fail-closed FFmpeg text/image renderer for n8n Render Free demo.
 
 No external media fetching, no arbitrary FFmpeg command execution, and no
 persistent storage. Demo links are bearer URLs and expire after 1 hour.
 """
 
 import hmac
+import base64
+import binascii
 import json
 import math
 import os
@@ -16,6 +18,8 @@ import tempfile
 import threading
 import time
 import textwrap
+import struct
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -26,9 +30,94 @@ ROOT = Path("/tmp/tcg-render")
 ROOT.mkdir(parents=True, exist_ok=True)
 JOBS = {}
 LOCK = threading.Lock()
+REQUEST_LOCK = threading.Lock()
 COLORS = ["0x20263f", "0x193e52", "0x284735", "0x48304b", "0x3c3b25"]
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 EXPIRY = 3600
+VERSION = "2.0.0-rebuilt"
+MAX_IMAGE_BYTES = 1536 * 1024
+# Five base64-encoded 1.5 MiB images plus bounded JSON/text overhead.
+MAX_REQUEST_BYTES = 5 * 4 * ((MAX_IMAGE_BYTES + 2) // 3) + 65536
+MAX_IMAGE_SIDE = 4096
+MAX_IMAGE_PIXELS = 12_000_000
+MOTIONS = {"still", "zoom_in", "zoom_out", "pan_left", "pan_right"}
+
+
+def image_dimensions(raw):
+    """Inspect PNG/JPEG headers before allowing FFmpeg to decode local bytes."""
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        pos, width, height, seen_idat = 8, None, None, False
+        while pos + 12 <= len(raw):
+            length = struct.unpack_from(">I", raw, pos)[0]
+            kind = raw[pos + 4:pos + 8]
+            end = pos + 12 + length
+            if end > len(raw):
+                raise ValueError("Truncated PNG")
+            chunk = raw[pos + 8:pos + 8 + length]
+            crc = struct.unpack_from(">I", raw, pos + 8 + length)[0]
+            if zlib.crc32(kind + chunk) & 0xffffffff != crc:
+                raise ValueError("Invalid PNG checksum")
+            if width is None and kind != b"IHDR":
+                raise ValueError("PNG must start with IHDR")
+            if kind == b"IHDR":
+                if width is not None or length != 13:
+                    raise ValueError("Invalid PNG header")
+                width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", chunk)
+                valid_depths = {0: {1, 2, 4, 8, 16}, 2: {8, 16}, 3: {1, 2, 4, 8}, 4: {8, 16}, 6: {8, 16}}
+                if depth not in valid_depths.get(color, set()) or compression != 0 or filtering != 0 or interlace not in (0, 1):
+                    raise ValueError("Unsupported PNG header")
+            elif kind in {b"acTL", b"fcTL", b"fdAT"}:
+                raise ValueError("Animated PNG not allowed")
+            elif kind == b"IDAT":
+                seen_idat = True
+            elif kind == b"IEND":
+                if length or end != len(raw) or not seen_idat:
+                    raise ValueError("Invalid PNG end")
+                return width, height, ".png"
+            pos = end
+        raise ValueError("Incomplete PNG")
+    if raw.startswith(b"\xff\xd8") and raw.endswith(b"\xff\xd9"):
+        pos = 2
+        while pos < len(raw) - 2:
+            if raw[pos] != 0xff:
+                raise ValueError("Invalid JPEG marker")
+            while pos < len(raw) and raw[pos] == 0xff:
+                pos += 1
+            if pos >= len(raw):
+                break
+            marker = raw[pos]
+            pos += 1
+            if marker in {0xd9, 0xda}:
+                break
+            if marker in {0x01, *range(0xd0, 0xd8)}:
+                continue
+            if pos + 2 > len(raw):
+                break
+            length = struct.unpack_from(">H", raw, pos)[0]
+            if length < 2 or pos + length > len(raw):
+                raise ValueError("Truncated JPEG")
+            if marker in {0xc0, 0xc1, 0xc2}:
+                if length < 8 or raw[pos + 2] != 8:
+                    raise ValueError("Unsupported JPEG header")
+                height, width = struct.unpack_from(">HH", raw, pos + 3)
+                return width, height, ".jpg"
+            pos += length
+    raise ValueError("Only static PNG and JPEG images allowed")
+
+
+def decode_image(value):
+    if not isinstance(value, str) or not value or len(value) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
+        raise ValueError("Image base64 missing or too large")
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as ex:
+        raise ValueError("Invalid image base64") from ex
+    if not 0 < len(raw) <= MAX_IMAGE_BYTES:
+        raise ValueError("Maximum image size is 1.5 MiB")
+    width, height, suffix = image_dimensions(raw)
+    if not 64 <= width <= MAX_IMAGE_SIDE or not 64 <= height <= MAX_IMAGE_SIDE or width * height > MAX_IMAGE_PIXELS:
+        raise ValueError("Image dimensions outside allowed limits")
+    return raw, suffix
 
 
 def validate_manifest(data):
@@ -42,8 +131,10 @@ def validate_manifest(data):
         raise ValueError("Exactly five scenes required")
     cleaned = []
     seconds = 0
+    image_mode = any(isinstance(item, dict) and "image_b64" in item for item in scenes)
     for item in scenes:
-        if not isinstance(item, dict) or set(item.keys()) - {"text", "dauer_s"}:
+        allowed = {"text", "dauer_s", "image_b64", "motion"} if image_mode else {"text", "dauer_s"}
+        if not isinstance(item, dict) or set(item.keys()) - allowed:
             raise ValueError("Each scene needs only text and dauer_s")
         label = item.get("text")
         duration = item.get("dauer_s")
@@ -53,6 +144,12 @@ def validate_manifest(data):
             raise ValueError("Scene duration must be a whole number, 2 to 12 seconds")
         seconds += int(duration)
         cleaned.append({"text": label, "dauer_s": int(duration)})
+        if image_mode:
+            raw, suffix = decode_image(item.get("image_b64"))
+            motion = item.get("motion", "still")
+            if not isinstance(motion, str) or motion not in MOTIONS:
+                raise ValueError("Unknown motion")
+            cleaned[-1].update(image_bytes=raw, image_suffix=suffix, motion=motion)
     if seconds > 45:
         raise ValueError("Maximum 45 seconds")
     return cleaned
@@ -63,6 +160,45 @@ def ffmpeg(cmd, timeout=150):
                           stderr=subprocess.PIPE).stderr.decode("utf-8", errors="replace")
 
 
+def render_image_scene(work, index, scene, output):
+    source = work / f"image_{index}{scene['image_suffix']}"
+    source.write_bytes(scene["image_bytes"])
+    label = "\n".join(textwrap.wrap(" ".join(scene["text"].split()), width=22))
+    overlay = f"HYPOTHESE  -  BILDTEST\n\nSZENE {index+1}/5\n\n{label}"
+    textfile = work / f"scene_{index}.txt"
+    textfile.write_text(overlay, encoding="utf-8")
+    frames = scene["dauer_s"] * 12
+    progress = f"on/{frames - 1}"
+    motion = scene["motion"]
+    zoom = {"zoom_in": f"1+0.08*{progress}", "zoom_out": f"1.08-0.08*{progress}"}.get(motion, "1.08" if motion.startswith("pan_") else "1")
+    x = "(iw-iw/zoom)/2"
+    if motion == "pan_right":
+        x = f"(iw-iw/zoom)*{progress}"
+    elif motion == "pan_left":
+        x = f"(iw-iw/zoom)*(1-{progress})"
+    vf = ("scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,"
+          f"zoompan=z='{zoom}':x='{x}':y='(ih-ih/zoom)/2':d={frames}:s=360x640:fps=12,"
+          f"drawtext=fontfile={FONT}:textfile={textfile}:expansion=none:"
+          "fontcolor=white:fontsize=23:line_spacing=12:x=(w-text_w)/2:y=h-text_h-36:"
+          "box=1:boxcolor=black@0.55:boxborderw=12")
+    # Restrict decoding to a generated local file; no user URLs or filters.
+    ffmpeg(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-xerror", "-filter_threads", "1", "-threads", "1", "-protocol_whitelist", "file,pipe",
+            "-max_pixels", str(MAX_IMAGE_PIXELS), "-f", "image2", "-i", str(source), "-vf", vf, "-frames:v", str(frames),
+            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+            "-pix_fmt", "yuv420p", "-threads", "1", str(output)], timeout=120)
+
+
+def output_metadata(path):
+    result = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                             "format=duration:stream=width,height", "-of", "json", str(path)],
+                            timeout=15, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    data = json.loads(result.stdout)
+    stream = data["streams"][0]
+    return {"duration_s": float(data["format"]["duration"]), "file_size_bytes": path.stat().st_size,
+            "width": stream["width"], "height": stream["height"]}
+
+
 def render(job_id, scenes):
     work = ROOT / job_id
     try:
@@ -70,6 +206,11 @@ def render(job_id, scenes):
         listfile = work / "files.txt"
         parts = []
         for i, scene in enumerate(scenes):
+            if "image_bytes" in scene:
+                path = work / f"part_{i}.mp4"
+                render_image_scene(work, i, scene, path)
+                parts.append(path)
+                continue
             # Plain text file keeps user text out of the FFmpeg filter expression.
             label = "\n".join(textwrap.wrap(" ".join(scene["text"].split()), width=22))
             overlay = f"HYPOTHESE  -  TESTVIDEO\n\nSZENE {i+1}/5\n\n{label}"
@@ -87,7 +228,9 @@ def render(job_id, scenes):
         ffmpeg(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                 "-f", "concat", "-safe", "0", "-i", str(listfile), "-c", "copy",
                 "-movflags", "+faststart", str(work / "preview.mp4")], timeout=60)
+        metadata = output_metadata(work / "preview.mp4")
         with LOCK:
+            JOBS[job_id].update(metadata)
             JOBS[job_id]["status"] = "done"
     except Exception as ex:
         with LOCK:
@@ -120,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
         cleanup()
         path = urlsplit(self.path).path
         if path == "/health":
-            return self.send_json(200, {"service": "tcg-media-renderer", "running": True, "render_enabled": bool(API_KEY)})
+            return self.send_json(200, {"service": "tcg-media-renderer", "running": True, "render_enabled": bool(API_KEY), "version": VERSION, "image_mode": True})
         match = re.fullmatch(r"/(status|download)/([A-Za-z0-9_-]{28,64})", path)
         if not match:
             return self.send_json(404, {"error": "not_found"})
@@ -132,6 +275,7 @@ class Handler(BaseHTTPRequestHandler):
         if kind == "status":
             return self.send_json(200, {"job_id": jid, "status": job["status"],
                                         "error": job.get("error"),
+                                        **{key: job[key] for key in ("duration_s", "file_size_bytes", "width", "height") if key in job},
                                         "download_path": f"/download/{jid}" if job["status"] == "done" else None})
         if job["status"] != "done":
             return self.send_json(409, {"error": "not_ready"})
@@ -155,14 +299,35 @@ class Handler(BaseHTTPRequestHandler):
         if not API_KEY:
             return self.send_json(503, {"error": "RENDER_API_KEY_not_configured"})
         provided = self.headers.get("X-API-Key", "")
-        if not hmac.compare_digest(provided, API_KEY):
+        if not hmac.compare_digest(provided.encode("utf-8"), API_KEY.encode("utf-8")):
             return self.send_json(401, {"error": "unauthorized"})
+        if not REQUEST_LOCK.acquire(blocking=False):
+            return self.send_json(429, {"error": "renderer_busy"})
+        try:
+            return self.accept_render()
+        finally:
+            REQUEST_LOCK.release()
+
+    def accept_render(self):
+        with LOCK:
+            if any(job["status"] in ("queued", "rendering") for job in JOBS.values()):
+                return self.send_json(429, {"error": "renderer_busy"})
         try:
             size = int(self.headers.get("Content-Length", "-1"))
-            if not 0 < size <= 32768:
+            if not 0 < size <= MAX_REQUEST_BYTES:
                 return self.send_json(413, {"error": "request_too_large_or_missing_length"})
-            data = json.loads(self.rfile.read(size).decode("utf-8"))
+            self.connection.settimeout(15)
+            raw = self.rfile.read(size)
+            if len(raw) != size:
+                return self.send_json(400, {"error": "incomplete_request"})
+            data = json.loads(raw.decode("utf-8"))
+            scenes_input = data.get("scenes") if isinstance(data, dict) else None
+            has_images = isinstance(scenes_input, list) and any(isinstance(s, dict) and "image_b64" in s for s in scenes_input)
+            if size > 32768 and not has_images:
+                return self.send_json(413, {"error": "legacy_request_too_large"})
             scenes = validate_manifest(data)
+        except TimeoutError:
+            return self.send_json(408, {"error": "request_timeout"})
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as ex:
             return self.send_json(400, {"error": "invalid_manifest", "detail": str(ex)[:180]})
         with LOCK:
